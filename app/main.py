@@ -14,11 +14,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from .gs1 import GS1ParseError, parse
 from .pickplan import DemandValidationError, pick_plan
+from .recall import ItemConflictError, RuleValidationError, assess
 from .summary import WeightSummaryError, summarize
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -41,7 +42,17 @@ app = FastAPI(
         "package: the plan then picks the package subset reaching the "
         "demanded quantity with the smallest overage (reported as overage; "
         "shortage never goes negative), or every eligible package when no "
-        "subset suffices."
+        "subset suffices. POST /recall-impact evaluates ordered recall "
+        "rules over scanned physical items identified by GTIN + serial "
+        "number (each scan carries AI 01, AI 17, AI 21 and one weight AI, "
+        "AI 10 optional): identical re-scans of an item count once, "
+        "re-scans conflicting on batch, expiry or weight are rejected with "
+        "the current and first scan indices, and every item joins the "
+        "first rule whose GTIN, optional batch set and optional inclusive "
+        "expiry interval (YYMMDD, day 00 = last day of month) it matches. "
+        "The response keeps the rule order and reports per-rule package "
+        "counts and six-decimal half-even total weights, plus an aggregate "
+        "of the items no rule matched."
     ),
 )
 
@@ -283,6 +294,118 @@ class WeightPickPlanResponse(BaseModel):
     demands: list[DemandPlan]
 
 
+class RecallRule(BaseModel):
+    gtin: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "GTIN (AI 01 value) the rule applies to; compared literally, "
+            "no check-digit validation."
+        ),
+        examples=["09501101530003"],
+    )
+    batches: list[str | None] | None = Field(
+        default=None,
+        description=(
+            "Optional set of AI 10 batch/lot values: an item matches only "
+            "when its batch is in the set (a null entry matches items "
+            "scanned without AI 10). Omitted or null means any batch."
+        ),
+        examples=[["B1", "B2"]],
+    )
+    expiry_from: str | None = Field(
+        default=None,
+        description=(
+            "Optional inclusive lower bound on the item's actual AI 17 "
+            "expiry date, as a 6-digit YYMMDD string (day 00 = last day "
+            "of the month)."
+        ),
+        examples=["250101"],
+    )
+    expiry_to: str | None = Field(
+        default=None,
+        description=(
+            "Optional inclusive upper bound on the item's actual AI 17 "
+            "expiry date, same YYMMDD form as expiry_from."
+        ),
+        examples=["250331"],
+    )
+
+
+class RecallImpactRequest(BaseModel):
+    scans: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs, one per "
+            "physical item scan. Each must contain exactly one AI 01, "
+            "exactly one AI 17 (expiry), exactly one AI 21 (serial), at "
+            "most one AI 10 and exactly one weight AI 310n/320n."
+        ),
+        examples=[
+            [
+                "01095011015300031725013110B1\x1d21SN0001\x1d3103002000",
+                "01095011015300031725022810B2\x1d21SN0002\x1d3202002513",
+            ]
+        ],
+    )
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description='Unit of every total in the response: "kg" or "lb" (default "kg").',
+    )
+    rules: list[RecallRule] = Field(
+        ...,
+        description=(
+            "Ordered recall rules; every physical item joins the first "
+            "rule it matches, and the response keeps this order."
+        ),
+        examples=[[{"gtin": "09501101530003", "batches": ["B1"]}]],
+    )
+
+
+class RecallRuleResult(BaseModel):
+    """OpenAPI shape of one rule's tally; totals render as exact JSON numbers."""
+
+    rule_index: int = Field(description="Position of the rule in the request")
+    gtin: str = Field(description="Echoed rule GTIN")
+    batches: list[str | None] | None = Field(
+        description="Echoed rule batch set; null when the rule has none"
+    )
+    expiry_from: str | None = Field(
+        description="Echoed inclusive lower expiry bound (YYMMDD); null when absent"
+    )
+    expiry_to: str | None = Field(
+        description="Echoed inclusive upper expiry bound (YYMMDD); null when absent"
+    )
+    package_count: int = Field(
+        description="Number of distinct physical items claimed by this rule"
+    )
+    unit: Literal["kg", "lb"] = Field(description="Unit of total_weight (the target unit)")
+    total_weight: float = Field(
+        description=(
+            "Sum of the claimed items' net weights in the target unit, "
+            "rounded to six decimal places with round-half-even. Rendered "
+            "as a JSON number (e.g. 2.513000); computed internally with "
+            "Decimal, never float."
+        )
+    )
+
+
+class UnmatchedItems(BaseModel):
+    """OpenAPI shape of the aggregate of items no rule matched."""
+
+    package_count: int = Field(description="Number of unmatched physical items")
+    unit: Literal["kg", "lb"] = Field(description="Unit of total_weight (the target unit)")
+    total_weight: float = Field(
+        description="Sum of the unmatched items' net weights (six decimal places)"
+    )
+
+
+class RecallImpactResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    rules: list[RecallRuleResult]
+    unmatched: UnmatchedItems
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -376,6 +499,32 @@ def _build_pick_plan_response(result: dict) -> Response:
     return Response(content=_dump(payload), media_type="application/json")
 
 
+def _build_recall_response(result: dict) -> Response:
+    """Quantize totals half-even to six places and render exact JSON."""
+    payload = {
+        "target_unit": result["target_unit"],
+        "rules": [
+            {
+                "rule_index": rule["rule_index"],
+                "gtin": rule["gtin"],
+                "batches": rule["batches"],
+                "expiry_from": rule["expiry_from"],
+                "expiry_to": rule["expiry_to"],
+                "package_count": rule["package_count"],
+                "unit": rule["unit"],
+                "total_weight": _six(rule["total_weight"]),
+            }
+            for rule in result["rules"]
+        ],
+        "unmatched": {
+            "package_count": result["unmatched"]["package_count"],
+            "unit": result["unmatched"]["unit"],
+            "total_weight": _six(result["unmatched"]["total_weight"]),
+        },
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -420,3 +569,22 @@ def weight_pick_plan(req: WeightPickPlanRequest) -> Response:
     except (WeightSummaryError, DemandValidationError) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_pick_plan_response(result)
+
+
+@app.post(
+    "/recall-impact",
+    response_model=RecallImpactResponse,
+)
+def recall_impact(req: RecallImpactRequest) -> Response:
+    try:
+        result = assess(
+            req.scans,
+            req.target_unit,
+            [
+                (r.gtin, r.batches, r.expiry_from, r.expiry_to)
+                for r in req.rules
+            ],
+        )
+    except (WeightSummaryError, RuleValidationError, ItemConflictError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_recall_response(result)

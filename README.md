@@ -418,7 +418,7 @@ curl -X POST http://localhost:8080/weight-pick-plan \
 ```bash
 curl -X POST http://localhost:8080/weight-pick-plan \
   -H "Content-Type: application/json" \
-  -d '{"as_of": "2025-01-01", "scans": ["01095011015300031725013110P13103002000", "01095011015300031725022810P23103003000", "01095011015300031725033110P33103004000"], "demands": [{"gtin": "09501101530003", "quantity": 5, "package_mode": "whole"}]}'
+  -d '{"as_of": "2025-01-01", "scans": ["01095011015300031725013110P1\u001d3103002000", "01095011015300031725022810P2\u001d3103003000", "01095011015300031725033110P3\u001d3103004000"], "demands": [{"gtin": "09501101530003", "quantity": 5, "package_mode": "whole"}]}'
 ```
 
 ```json
@@ -495,6 +495,107 @@ curl -X POST http://localhost:8080/weight-pick-plan \
 }
 ```
 
+## 召回范围盘点 `POST /recall-impact`
+
+一次提交多条扫码字符串和一组**有序召回规则**，按 **GTIN + 序列号（AI 01 + AI 21）**
+识别实物，统计每条规则命中的包裹数与总净重，并汇总未命中任何规则的实物。
+
+- 请求体：`{"scans": [...], "target_unit": "kg", "rules": [{"gtin": "...", "batches": ["B1"], "expiry_from": "250101", "expiry_to": "250228"}]}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`scans` 中的每一项既可以是
+  元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每条扫描必须包含**恰好一个 AI 01**、**恰好一个 AI 17**（效期）、**恰好一个 AI 21**
+  （序列号）、**零个或一个 AI 10**（批号可缺省）和**恰好一个重量 AI**（310n 或 320n，
+  允许混合千克/磅）。任一条扫描解析失败或缺少/重复必需 AI，整个请求返回 `422`，
+  `detail.scan_index` 给出出错下标（从 0 开始），`detail.error` 为该条扫描的原始错误
+  （结构同 `/parse`）。
+- 实物识别与去重：**GTIN + 序列号**唯一确定一个实物。同一实物被重复扫描且批号、
+  效期、重量完全一致时**只计一次**（效期按 AI 17 原值比较；重量按单位相同且数值
+  精确相等判断，例如 `3103 002513` 与 `3104 025130` 同为 2.513 kg）。若同一实物的
+  两次扫描在**批号、效期或重量**上不一致，整个请求返回 `422`：`detail.scan_index`
+  为当前（冲突）扫描下标，`detail.first_index` 为该实物首次出现的下标，
+  `detail.error.error` 为 `CONFLICTING_BATCH` / `CONFLICTING_EXPIRY` /
+  `CONFLICTING_WEIGHT`。
+- 规则字段：`gtin` 必填（仅作匹配条件，不校验校验位）；`batches` 可选批号集合——
+  省略时匹配任意批号，给定时实物的 AI 10 必须在集合内（集合中的 `null` 匹配无批号
+  实物；空集合不匹配任何实物）；`expiry_from` / `expiry_to` 可选效期闭区间边界，
+  格式为 6 位 YYMMDD（日 `00` 表示当月最后一天），按**实际日期**比较、两端皆含，
+  可只给一端。边界不是 6 位数字、不是真实日期或 `expiry_from` 晚于 `expiry_to`
+  时返回 `422`，`detail.rule_index` 定位出错规则（错误码 `INVALID_EXPIRY_BOUND` /
+  `INVALID_DATE` / `EXPIRY_RANGE_INVERTED`）。规则校验先于扫描解析。
+- 匹配：实物按规则**原序**归入**首条**命中的规则；未命中任何规则的实物计入
+  `unmatched`。
+- 响应：`target_unit`、与请求同序的 `rules` 数组和 `unmatched`。每条规则回显
+  `rule_index`、`gtin`、`batches`、`expiry_from`、`expiry_to`，并给出 `package_count`
+  （命中实物数）、`unit` 与 `total_weight`；`unmatched` 给出未命中实物的
+  `package_count`、`unit` 与 `total_weight`。所有总重全程 `Decimal` 计算（换算系数
+  **1 lb = 0.45359237 kg**），仅在响应时按**六位小数 half-even（银行家舍入）**输出
+  为 JSON 数字（如 `2.513000`）。
+- `scans` 为空时所有规则与 `unmatched` 均为 `0` / `0.000000`；`rules` 为空时全部
+  实物计入 `unmatched`。
+
+请求示例（`SN2` 被重复扫描且属性一致只计一次；`SN3` 批号不在集合内而未命中）：
+
+```bash
+curl -X POST http://localhost:8080/recall-impact \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "scans": ["01095011015300031725013110B1\u001d21SN1\u001d3103002000", "01095011015300031725022810B2\u001d21SN2\u001d3103003000", "01095011015300031725022810B2\u001d21SN2\u001d3103003000", "01095011015300031725033110B9\u001d21SN3\u001d3202002513"], "rules": [{"gtin": "09501101530003", "batches": ["B1", "B2"], "expiry_from": "250101", "expiry_to": "250228"}]}'
+```
+
+响应 `200 OK`：规则命中 `SN1`（2 kg）与 `SN2`（3 kg）共 2 包 5 kg；`SN3`
+（25.13 lb ≈ 11.398776 kg）未命中：
+
+```json
+{
+  "target_unit": "kg",
+  "rules": [
+    {
+      "rule_index": 0,
+      "gtin": "09501101530003",
+      "batches": ["B1", "B2"],
+      "expiry_from": "250101",
+      "expiry_to": "250228",
+      "package_count": 2,
+      "unit": "kg",
+      "total_weight": 5.000000
+    }
+  ],
+  "unmatched": {"package_count": 1, "unit": "kg", "total_weight": 11.398776}
+}
+```
+
+同一实物两次扫描属性冲突时返回 `422`（当前下标 1 与首次下标 0 一并给出）：
+
+```json
+{
+  "detail": {
+    "scan_index": 1,
+    "first_index": 0,
+    "error": {
+      "error": "CONFLICTING_BATCH",
+      "message": "scan 1: item GTIN '09501101530003' serial 'SN1' was first scanned at index 0 with batch 'B1', but this scan has batch 'B2'",
+      "expected": "batch 'B1' (scan 0)",
+      "found": "batch 'B2'"
+    }
+  }
+}
+```
+
+规则效期区间倒置时返回 `422`，`detail.rule_index` 定位出错规则：
+
+```json
+{
+  "detail": {
+    "rule_index": 0,
+    "error": {
+      "error": "EXPIRY_RANGE_INVERTED",
+      "message": "rule 0: expiry_from '250331' (2025-03-31) is after expiry_to '250131' (2025-01-31)",
+      "expected": "expiry_from on or before expiry_to",
+      "found": "250331 > 250131"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -549,14 +650,16 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
+  recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
 tests/
   test_parse.py
   test_weight_summary.py
   test_weight_pick_plan.py
+  test_recall_impact.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
